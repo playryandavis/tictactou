@@ -1,0 +1,425 @@
+import math
+import random
+import sys
+from dataclasses import dataclass
+
+import pygame
+
+BOARD_SIZE = 20
+VIEW_SIZE = 3
+CELL_SIZE = 24
+MARGIN = 30
+SIDE_PANEL = 220
+SCREEN_WIDTH = BOARD_SIZE * CELL_SIZE + MARGIN * 2 + SIDE_PANEL
+SCREEN_HEIGHT = BOARD_SIZE * CELL_SIZE + MARGIN * 2 + 40
+
+BG_COLOR = (18, 18, 24)
+GRID_COLOR = (52, 52, 64)
+X_COLOR = (231, 90, 82)
+O_COLOR = (90, 182, 231)
+VIEW_COLOR = (238, 204, 98)
+STRIP_COLOR = (120, 220, 160)
+TEXT_COLOR = (235, 235, 240)
+PANEL_COLOR = (30, 30, 40)
+
+DIRECTIONS = {
+    "up": (0, -1),
+    "down": (0, 1),
+    "left": (-1, 0),
+    "right": (1, 0),
+}
+
+
+@dataclass
+class GameState:
+    board: list
+    view_x: int
+    view_y: int
+    current: str
+    awaiting_place: bool
+    strip_cells: list
+    game_over: bool
+    winner: str | None
+    message: str
+
+
+def new_game() -> GameState:
+    board = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]
+    start = (BOARD_SIZE - VIEW_SIZE) // 2
+    return GameState(
+        board=board,
+        view_x=start,
+        view_y=start,
+        current="X",
+        awaiting_place=False,
+        strip_cells=[],
+        game_over=False,
+        winner=None,
+        message="",
+    )
+
+
+def in_bounds(x: int, y: int) -> bool:
+    return 0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE
+
+
+def viewport_cells(view_x: int, view_y: int) -> list:
+    return [
+        (view_x + dx, view_y + dy)
+        for dy in range(VIEW_SIZE)
+        for dx in range(VIEW_SIZE)
+    ]
+
+
+def revealed_strip(old_x: int, old_y: int, new_x: int, new_y: int) -> list:
+    if new_x > old_x:
+        col = new_x + VIEW_SIZE - 1
+        return [(col, new_y + dy) for dy in range(VIEW_SIZE)]
+    if new_x < old_x:
+        col = new_x
+        return [(col, new_y + dy) for dy in range(VIEW_SIZE)]
+    if new_y > old_y:
+        row = new_y + VIEW_SIZE - 1
+        return [(new_x + dx, row) for dx in range(VIEW_SIZE)]
+    if new_y < old_y:
+        row = new_y
+        return [(new_x + dx, row) for dx in range(VIEW_SIZE)]
+    return []
+
+
+def empty_cells(board: list, cells: list) -> list:
+    return [cell for cell in cells if board[cell[1]][cell[0]] is None]
+
+
+def check_winner(board: list) -> str | None:
+    for y in range(BOARD_SIZE):
+        for x in range(BOARD_SIZE):
+            symbol = board[y][x]
+            if symbol is None:
+                continue
+            for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+                if all(
+                    in_bounds(x + i * dx, y + i * dy)
+                    and board[y + i * dy][x + i * dx] == symbol
+                    for i in range(3)
+                ):
+                    return symbol
+    return None
+
+
+def immediate_win_cells(board: list, symbol: str) -> set:
+    wins = set()
+    for y in range(BOARD_SIZE):
+        for x in range(BOARD_SIZE):
+            if board[y][x] is not None:
+                continue
+            board[y][x] = symbol
+            if check_winner(board) == symbol:
+                wins.add((x, y))
+            board[y][x] = None
+    return wins
+
+
+def line_score(board: list, x: int, y: int, symbol: str) -> int:
+    score = 0
+    for dx, dy in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+        count = 1
+        for direction in (1, -1):
+            step = 1
+            while True:
+                nx = x + dx * step * direction
+                ny = y + dy * step * direction
+                if not in_bounds(nx, ny):
+                    break
+                if board[ny][nx] != symbol:
+                    break
+                count += 1
+                step += 1
+        score += count * count
+    return score
+
+
+def center_bias(x: int, y: int) -> float:
+    center = (BOARD_SIZE - 1) / 2
+    dist = math.hypot(x - center, y - center)
+    return -dist
+
+
+def evaluate_move(board: list, move: str, view_x: int, view_y: int) -> tuple:
+    dx, dy = DIRECTIONS[move]
+    new_x = view_x + dx
+    new_y = view_y + dy
+    strip = revealed_strip(view_x, view_y, new_x, new_y)
+    empties = empty_cells(board, strip)
+    placements = empties or [None]
+
+    cpu_symbol = "O"
+    player_symbol = "X"
+    player_wins = immediate_win_cells(board, player_symbol)
+
+    best_score = -1e9
+    best_placements = []
+
+    for placement in placements:
+        score = 0
+        if placement:
+            px, py = placement
+            board[py][px] = cpu_symbol
+            if check_winner(board) == cpu_symbol:
+                score = 1_000_000
+            else:
+                if placement in player_wins:
+                    score += 200_000
+                score += line_score(board, px, py, cpu_symbol) * 8
+                score += line_score(board, px, py, player_symbol) * 3
+                score += center_bias(px, py) * 5
+            board[py][px] = None
+        else:
+            score -= 200
+
+        score += center_bias(new_x + 1, new_y + 1) * 2
+
+        if score > best_score:
+            best_score = score
+            best_placements = [placement]
+        elif score == best_score:
+            best_placements.append(placement)
+
+    placement_choice = random.choice(best_placements)
+    return best_score, (new_x, new_y), strip, placement_choice
+
+
+def cpu_take_turn(state: GameState) -> None:
+    best_score = -1e9
+    candidates = []
+    for move in DIRECTIONS:
+        dx, dy = DIRECTIONS[move]
+        new_x = state.view_x + dx
+        new_y = state.view_y + dy
+        if not (0 <= new_x <= BOARD_SIZE - VIEW_SIZE and 0 <= new_y <= BOARD_SIZE - VIEW_SIZE):
+            continue
+        score, (nx, ny), strip, placement = evaluate_move(
+            state.board, move, state.view_x, state.view_y
+        )
+        if score > best_score:
+            best_score = score
+            candidates = [(nx, ny, strip, placement)]
+        elif score == best_score:
+            candidates.append((nx, ny, strip, placement))
+
+    if not candidates:
+        return
+
+    nx, ny, strip, placement = random.choice(candidates)
+    state.view_x = nx
+    state.view_y = ny
+    state.strip_cells = strip
+
+    if placement:
+        px, py = placement
+        state.board[py][px] = "O"
+        winner = check_winner(state.board)
+        if winner:
+            state.game_over = True
+            state.winner = winner
+            state.message = "CPU wins!"
+            return
+
+    state.current = "X"
+    state.awaiting_place = False
+    state.strip_cells = []
+
+
+def move_view(state: GameState, move: str) -> bool:
+    dx, dy = DIRECTIONS[move]
+    new_x = state.view_x + dx
+    new_y = state.view_y + dy
+    if not (0 <= new_x <= BOARD_SIZE - VIEW_SIZE and 0 <= new_y <= BOARD_SIZE - VIEW_SIZE):
+        return False
+    strip = revealed_strip(state.view_x, state.view_y, new_x, new_y)
+    state.view_x = new_x
+    state.view_y = new_y
+    state.strip_cells = strip
+    empties = empty_cells(state.board, strip)
+    if empties:
+        state.awaiting_place = True
+    else:
+        end_turn(state)
+    return True
+
+
+def end_turn(state: GameState) -> None:
+    if state.game_over:
+        return
+    state.awaiting_place = False
+    state.strip_cells = []
+    if state.current == "X":
+        state.current = "O"
+        cpu_take_turn(state)
+    else:
+        state.current = "X"
+
+
+def handle_player_click(state: GameState, pos: tuple) -> None:
+    if not state.awaiting_place or state.current != "X" or state.game_over:
+        return
+    x, y = pos
+    board_left = MARGIN
+    board_top = MARGIN
+    if not (
+        board_left <= x <= board_left + BOARD_SIZE * CELL_SIZE
+        and board_top <= y <= board_top + BOARD_SIZE * CELL_SIZE
+    ):
+        return
+    grid_x = (x - board_left) // CELL_SIZE
+    grid_y = (y - board_top) // CELL_SIZE
+    cell = (grid_x, grid_y)
+    if cell not in state.strip_cells:
+        return
+    if state.board[grid_y][grid_x] is not None:
+        return
+    state.board[grid_y][grid_x] = "X"
+    winner = check_winner(state.board)
+    if winner:
+        state.game_over = True
+        state.winner = winner
+        state.message = "You win!"
+        return
+    end_turn(state)
+
+
+def draw_board(screen: pygame.Surface, state: GameState, font: pygame.font.Font) -> None:
+    screen.fill(BG_COLOR)
+    board_left = MARGIN
+    board_top = MARGIN
+
+    pygame.draw.rect(
+        screen,
+        PANEL_COLOR,
+        pygame.Rect(
+            board_left - 10,
+            board_top - 10,
+            BOARD_SIZE * CELL_SIZE + 20,
+            BOARD_SIZE * CELL_SIZE + 20,
+        ),
+    )
+
+    for y in range(BOARD_SIZE):
+        for x in range(BOARD_SIZE):
+            rect = pygame.Rect(
+                board_left + x * CELL_SIZE,
+                board_top + y * CELL_SIZE,
+                CELL_SIZE,
+                CELL_SIZE,
+            )
+            pygame.draw.rect(screen, GRID_COLOR, rect, 1)
+            symbol = state.board[y][x]
+            if symbol == "X":
+                padding = 5
+                pygame.draw.line(
+                    screen,
+                    X_COLOR,
+                    (rect.left + padding, rect.top + padding),
+                    (rect.right - padding, rect.bottom - padding),
+                    2,
+                )
+                pygame.draw.line(
+                    screen,
+                    X_COLOR,
+                    (rect.left + padding, rect.bottom - padding),
+                    (rect.right - padding, rect.top + padding),
+                    2,
+                )
+            elif symbol == "O":
+                pygame.draw.circle(
+                    screen,
+                    O_COLOR,
+                    rect.center,
+                    CELL_SIZE // 2 - 5,
+                    2,
+                )
+
+    view_rect = pygame.Rect(
+        board_left + state.view_x * CELL_SIZE,
+        board_top + state.view_y * CELL_SIZE,
+        VIEW_SIZE * CELL_SIZE,
+        VIEW_SIZE * CELL_SIZE,
+    )
+    pygame.draw.rect(screen, VIEW_COLOR, view_rect, 3)
+
+    for (sx, sy) in state.strip_cells:
+        rect = pygame.Rect(
+            board_left + sx * CELL_SIZE,
+            board_top + sy * CELL_SIZE,
+            CELL_SIZE,
+            CELL_SIZE,
+        )
+        pygame.draw.rect(screen, STRIP_COLOR, rect, 3)
+
+    panel_x = board_left + BOARD_SIZE * CELL_SIZE + 20
+    panel_rect = pygame.Rect(panel_x, board_top - 10, SIDE_PANEL - 30, 260)
+    pygame.draw.rect(screen, PANEL_COLOR, panel_rect)
+
+    lines = [
+        "Tic-Tac-Shift",
+        "", 
+        f"Turn: {'You (X)' if state.current == 'X' else 'CPU (O)'}",
+        f"Viewport: ({state.view_x}, {state.view_y})",
+        "", 
+        "Controls:",
+        "Arrow / WASD: move",
+        "Mouse: place in strip",
+        "R: restart",
+        "ESC: quit",
+    ]
+    if state.awaiting_place and state.current == "X":
+        lines.insert(3, "Place in highlighted strip!")
+
+    if state.game_over:
+        lines.insert(2, state.message or "Game Over")
+
+    for i, line in enumerate(lines):
+        text = font.render(line, True, TEXT_COLOR)
+        screen.blit(text, (panel_x, board_top + i * 22))
+
+
+def main() -> None:
+    pygame.init()
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+    pygame.display.set_caption("Tic-Tac-Shift")
+    font = pygame.font.SysFont(None, 22)
+    clock = pygame.time.Clock()
+    state = new_game()
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_r:
+                    state = new_game()
+                elif not state.game_over and state.current == "X" and not state.awaiting_place:
+                    if event.key in (pygame.K_UP, pygame.K_w):
+                        move_view(state, "up")
+                    elif event.key in (pygame.K_DOWN, pygame.K_s):
+                        move_view(state, "down")
+                    elif event.key in (pygame.K_LEFT, pygame.K_a):
+                        move_view(state, "left")
+                    elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                        move_view(state, "right")
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                handle_player_click(state, event.pos)
+
+        draw_board(screen, state, font)
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.quit()
+    sys.exit()
+
+
+if __name__ == "__main__":
+    main()
